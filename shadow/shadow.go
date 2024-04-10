@@ -219,6 +219,7 @@ func (s *shadow) Report(ctx context.Context, state interface{}) (*ThingDocument,
 		var hasDiff bool
 		var err error
 		state, hasDiff, err = stateDiff(s.doc.State.Reported, state)
+		
 		if err != nil {
 			return nil, err
 		}
