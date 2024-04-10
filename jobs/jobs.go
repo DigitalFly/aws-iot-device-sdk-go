@@ -34,12 +34,18 @@ type Jobs interface {
 	OnError(func(error))
 	// OnJobChange sets handler for job update.
 	OnJobChange(func(map[JobExecutionState][]JobExecutionSummary))
+	// OnJsonAccepted sets handler for CBOR accepted.
+	OnJsonAccepted(func(*GetStreamResponse))
+	// OnJsonRejected sets handler for CBOR rejected.
+	OnJsonRejected(func([]byte))
 	// GetPendingJobs gets list of pending jobs.
 	GetPendingJobs(ctx context.Context) (map[JobExecutionState][]JobExecutionSummary, error)
 	// DescribeJob gets details of specific job.
 	DescribeJob(ctx context.Context, id string) (*JobExecution, error)
 	// UpdateJob updates job status.
 	UpdateJob(ctx context.Context, j *JobExecution, s JobExecutionState, opt ...UpdateJobOption) error
+	// GetJson gets CBOR from stream.
+	GetJson(ctx context.Context, streamName string, fileId int, blockSize int, offset int)  (*JobExecution, error)
 }
 
 type jobs struct {
@@ -50,6 +56,9 @@ type jobs struct {
 	chResps     map[string]chan interface{}
 	onError     func(err error)
 	onJobChange func(map[JobExecutionState][]JobExecutionSummary)
+	onJsonAccepted func(*GetStreamResponse)
+	onJsonRejected func([]byte)
+	onCborRejected func([]byte)
 	msgToken    int
 }
 
@@ -80,6 +89,8 @@ func New(ctx context.Context, cli awsiotdev.Device) (Jobs, error) {
 		{j.topic("+/update/rejected"), mqtt.HandlerFunc(j.rejected)},
 		{j.topic("get/accepted"), mqtt.HandlerFunc(j.getAccepted)},
 		{j.topic("get/rejected"), mqtt.HandlerFunc(j.rejected)},
+		{"$aws/things/" + j.thingName + "/streams/+/data/json", mqtt.HandlerFunc(j.json)},
+		{"$aws/things/" + j.thingName + "/streams/+/rejected/json", mqtt.HandlerFunc(j.jsonRejected)},
 	} {
 		if err := j.ServeMux.Handle(sub.topic, sub.handler); err != nil {
 			return nil, ioterr.New(err, "registering message handlers")
@@ -90,6 +101,8 @@ func New(ctx context.Context, cli awsiotdev.Device) (Jobs, error) {
 		mqtt.Subscription{Topic: j.topic("notify"), QoS: mqtt.QoS1},
 		mqtt.Subscription{Topic: j.topic("get/#"), QoS: mqtt.QoS1},
 		mqtt.Subscription{Topic: j.topic("+/get/#"), QoS: mqtt.QoS1},
+		mqtt.Subscription{Topic: "$aws/things/" + j.thingName + "/streams/+/data/json", QoS: mqtt.QoS1},
+		mqtt.Subscription{Topic: "$aws/things/" + j.thingName + "/streams/+/rejected/json", QoS: mqtt.QoS1},
 	)
 	if err != nil {
 		return nil, ioterr.New(err, "subscribing jobs topics")
@@ -109,6 +122,36 @@ func (j *jobs) notify(msg *mqtt.Message) {
 
 	if cb != nil {
 		go cb(m.Jobs)
+	}
+}
+
+func (j *jobs) json(msg *mqtt.Message) {
+	
+	m := &GetStreamResponse{}
+	if err := json.Unmarshal(msg.Payload, m); err != nil {
+		j.handleError(ioterr.New(err, "unmarshaling job executions changed message"))
+		return
+	}
+	j.mu.Lock()
+	cb := j.onJsonAccepted
+	j.mu.Unlock()
+	if cb != nil {
+		go cb(m)
+	}
+}
+
+func (j *jobs) jsonRejected(msg *mqtt.Message) {
+	m := &jobExecutionsChangedMessage{}
+	if err := json.Unmarshal(msg.Payload, m); err != nil {
+		j.handleError(ioterr.New(err, "unmarshaling job executions changed message"))
+		return
+	}
+	j.mu.Lock()
+	cb := j.onJsonRejected
+	j.mu.Unlock()
+
+	if cb != nil {
+		go cb(msg.Payload)
 	}
 }
 
@@ -338,6 +381,18 @@ func (j *jobs) rejected(msg *mqtt.Message) {
 	j.handleResponse(e)
 }
 
+func (j *jobs) OnJsonAccepted(cb func(*GetStreamResponse)) {
+	j.mu.Lock()
+	j.onJsonAccepted = cb
+	j.mu.Unlock()
+}
+
+func (j *jobs) OnJsonRejected(cb func([]byte)) {
+	j.mu.Lock()
+	j.onJsonRejected = cb
+	j.mu.Unlock()
+}
+
 func (j *jobs) OnError(cb func(err error)) {
 	j.mu.Lock()
 	j.onError = cb
@@ -346,6 +401,7 @@ func (j *jobs) OnError(cb func(err error)) {
 
 func (j *jobs) handleError(err error) {
 	j.mu.Lock()
+	fmt.Println(err)
 	cb := j.onError
 	j.mu.Unlock()
 	if cb != nil {
@@ -357,4 +413,53 @@ func (j *jobs) OnJobChange(cb func(map[JobExecutionState][]JobExecutionSummary))
 	j.mu.Lock()
 	j.onJobChange = cb
 	j.mu.Unlock()
+}
+
+func (j *jobs) GetJson(ctx context.Context, streamName string, fileId int, blockSize int, offset int) (*JobExecution, error) {
+	req := &getStreamRequest{
+		ClientToken: j.token(),
+		Limit: blockSize,
+		Offset: offset,
+		FileId: fileId,
+		NumberOfBlocks: 1,
+	}
+	ch := make(chan interface{}, 1)
+	j.mu.Lock()
+	j.chResps[req.ClientToken] = ch
+	j.mu.Unlock()
+	defer func() {
+		j.mu.Lock()
+		delete(j.chResps, req.ClientToken)
+		j.mu.Unlock()
+	}()
+
+	breq, err := json.Marshal(req)
+	if err != nil {
+		return nil, ioterr.New(err, "marshaling request")
+	}
+
+	fmt.Printf("request %v", string(breq))
+	if err := j.cli.Publish(ctx,
+		&mqtt.Message{
+			Topic:   "$aws/things/" + j.thingName + "/streams/" + streamName + "/get/json",
+			QoS:     mqtt.QoS1,
+			Payload: breq,
+		},
+	); err != nil {
+		return nil, ioterr.New(err, "sending request")
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ioterr.New(ctx.Err(), "describing job")
+	case res := <-ch:
+		switch r := res.(type) {
+		case *describeJobExecutionResponse:
+			return &r.Execution, nil
+		case *ErrorResponse:
+			return nil, r
+		default:
+			return nil, ioterr.New(ErrInvalidResponse, "describing job")
+		}
+	}
 }

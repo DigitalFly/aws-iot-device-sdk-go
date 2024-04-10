@@ -73,6 +73,15 @@ type ErrorResponse struct {
 	ExecutionState JobExecutionStateDetails `json:"executionState"`
 }
 
+type GetStreamResponse struct {
+	ClientToken			string 	`json:"c"` // Client Token
+	FileId				int		`json:"f"` // Stream file id
+	Limit				int    	`json:"l"` // Block Size
+	Iter 				int    	`json:"i"` // Block Iteration
+	Offset 				int    	`json:"o"` // Offset
+	Payload				string   	`json:"p"` // Payload
+}
+
 // Error implements error interface.
 func (e *ErrorResponse) Error() string {
 	return fmt.Sprintf("%s (%s): %s", e.Code, e.ClientToken, e.Message)
@@ -126,4 +135,12 @@ type updateJobExecutionResponse struct {
 	JobDocument    interface{}       `json:"jobDocument"`
 	Timestamp      int64             `json:"timestamp"`
 	ClientToken    string            `json:"clientToken"`
+}
+
+type getStreamRequest struct {
+	ClientToken			string  `json:"c"` // Client Token
+	FileId				int		`json:"f"` // Stream file id
+	Limit				int     `json:"l"` // Block Size
+	Offset 				int     `json:"o"` // Offset
+	NumberOfBlocks		int		`json:"n"` // Number of blocks
 }
